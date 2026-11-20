@@ -14,6 +14,10 @@ services:
       APT_REPO_ORIGIN: "${APT_REPO_ORIGIN:-Internal APT Repository}"
       APT_REPO_LABEL: "${APT_REPO_LABEL:-Internal APT Repository}"
       APT_REPO_RETENTION: "${APT_REPO_RETENTION:-2}"
+      # GnuPG home holding the pre-provisioned signing secret keys. It lives
+      # inside the persistent data volume by default; override APT_REPO_GPG_HOME
+      # (and mount the directory read-only) to inject keys from a secret store.
+      APT_REPO_GPG_HOME: "${APT_REPO_GPG_HOME:-/data/gnupg}"
       # Number of uvicorn workers must be 1: publications are serialised by a
       # process-wide lock and by-hash garbage collection assumes a single
       # writer. Multiple workers would still be safe for reads, but keeping
@@ -22,6 +26,10 @@ services:
     volumes:
       - apt-repo-data:/data
       - ./clients:/clients:ro
+      # Example for externally managed keys. The directory must be writable by
+      # uid 10001: gpg creates its agent sockets inside the GnuPG home, so a
+      # read-only mount would make signing fail (set APT_REPO_GPG_HOME to it).
+      # - ./secrets/gnupg:/etc/apt-repo/gnupg
     healthcheck:
       test:
         - CMD

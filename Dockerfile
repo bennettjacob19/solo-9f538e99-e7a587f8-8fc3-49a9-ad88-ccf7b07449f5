@@ -7,9 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # `zstd` is only needed to validate packages whose control/data archives use
 # zstd compression when the Python `zstandard` wheel is unavailable. `curl` is
-# used by the documented smoke test.
+# used by the documented smoke test. `gnupg` provides the `gpg` executable
+# that produces the clearsigned InRelease files.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends zstd curl \
+    && apt-get install -y --no-install-recommends zstd curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv

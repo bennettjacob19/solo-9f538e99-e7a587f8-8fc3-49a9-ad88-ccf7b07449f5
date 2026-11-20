@@ -77,9 +77,21 @@ class Settings:
             "APT_REPO_MAX_BATCH_BYTES", 4 * 1024 * 1024 * 1024
         )
     )
+    #: Directory holding the GnuPG home with the pre-provisioned signing keys.
+    #: Defaults to a directory inside the data volume so the effective signing
+    #: state survives container restarts together with the repository.
+    gpg_home: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("APT_REPO_GPG_HOME", "") or ""
+        )
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
+        if not self.gpg_home or str(self.gpg_home) in ("", "."):
+            object.__setattr__(self, "gpg_home", self.data_dir / "gnupg")
+        else:
+            object.__setattr__(self, "gpg_home", Path(self.gpg_home).resolve())
         for attr in ("distribution", "component"):
             value = getattr(self, attr)
             if not _NAME_RE.match(value):
@@ -120,6 +132,21 @@ class Settings:
     @property
     def release_by_hash_prefix(self) -> str:
         return f"dists/{self.distribution}/by-hash/SHA256"
+
+    @property
+    def inrelease_path(self) -> str:
+        return f"dists/{self.distribution}/InRelease"
+
+    @property
+    def inrelease_prefix(self) -> str:
+        """Content-addressed InRelease store, outside the GC roots.
+
+        A rotation never creates a publication, therefore the InRelease cannot
+        be owned by a publication row; it is keyed by the Release hash and the
+        effective fingerprint set instead.
+        """
+
+        return f"dists/{self.distribution}/inrelease-by-hash/SHA256"
 
     @property
     def sources_line(self) -> str:

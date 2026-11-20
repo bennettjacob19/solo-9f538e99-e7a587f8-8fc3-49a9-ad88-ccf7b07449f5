@@ -59,8 +59,15 @@ from .indexer import (
     render_release,
     sha256_hex,
 )
+from .signing import GpgError, GpgSigner
 
 _CHUNK = 1024 * 1024
+
+
+def keyset_hash(fingerprints: list[str]) -> str:
+    """Stable, order-sensitive identifier for an effective key set."""
+
+    return hashlib.sha256("\n".join(fingerprints).encode("ascii")).hexdigest()
 
 
 class PublicationError(Exception):
@@ -98,6 +105,8 @@ class Publication:
     index_size: int
     package_count: int
     error: str | None = None
+    signing_fingerprints: tuple[str, ...] = ()
+    inrelease_sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -109,6 +118,8 @@ class Publication:
             "index_size": self.index_size,
             "package_count": self.package_count,
             "error": self.error,
+            "signing_fingerprints": list(self.signing_fingerprints),
+            "inrelease_sha256": self.inrelease_sha256,
         }
 
 
@@ -182,6 +193,7 @@ class Repository:
         self.incoming = self.root / "incoming"
         self.db_path = self.root / "state.sqlite3"
         self.lock_path = self.root / ".publish.lock"
+        self.signer = GpgSigner(settings.gpg_home)
         self._thread_lock = threading.Lock()
         self._initialise()
 
@@ -207,7 +219,9 @@ class Repository:
                     index_size INTEGER NOT NULL,
                     package_count INTEGER NOT NULL,
                     packages_json TEXT NOT NULL,
-                    error TEXT
+                    error TEXT,
+                    signing_fingerprints_json TEXT,
+                    inrelease_sha256 TEXT
                 );
                 CREATE TABLE IF NOT EXISTS publication_files (
                     publication_id INTEGER NOT NULL REFERENCES publications(id),
@@ -215,15 +229,49 @@ class Repository:
                     role TEXT NOT NULL,
                     PRIMARY KEY (publication_id, path)
                 );
+                CREATE TABLE IF NOT EXISTS signing_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    updated_at TEXT NOT NULL,
+                    publication_id INTEGER NOT NULL REFERENCES publications(id),
+                    release_sha256 TEXT NOT NULL,
+                    fingerprints_json TEXT NOT NULL,
+                    keyset_sha256 TEXT NOT NULL,
+                    inrelease_sha256 TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS signing_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    requested_json TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    detail TEXT
+                );
                 """
             )
+            self._migrate_schema(db)
         self.reconcile()
+
+    def _migrate_schema(self, db: sqlite3.Connection) -> None:
+        """Add signing columns to journals created by an earlier version."""
+
+        columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(publications)")
+        }
+        if "signing_fingerprints_json" not in columns:
+            db.execute(
+                "ALTER TABLE publications ADD COLUMN "
+                "signing_fingerprints_json TEXT"
+            )
+        if "inrelease_sha256" not in columns:
+            db.execute(
+                "ALTER TABLE publications ADD COLUMN inrelease_sha256 TEXT"
+            )
 
     def _ensure_index_dirs(self) -> None:
         s = self.settings
         for relative in (
             f"dists/{s.distribution}/{s.index_dir}/by-hash/SHA256",
             f"dists/{s.distribution}/by-hash/SHA256",
+            f"dists/{s.distribution}/inrelease-by-hash/SHA256",
         ):
             (self.export / relative).mkdir(parents=True, exist_ok=True)
 
@@ -254,6 +302,10 @@ class Repository:
 
     # ---------------------------------------------------------------- queries
     def _row_to_publication(self, row: sqlite3.Row) -> Publication:
+        fingerprints: tuple[str, ...] = ()
+        raw = row["signing_fingerprints_json"] if "signing_fingerprints_json" in row.keys() else None
+        if raw:
+            fingerprints = tuple(json.loads(raw))
         return Publication(
             id=row["id"],
             created_at=row["created_at"],
@@ -263,6 +315,8 @@ class Repository:
             index_size=row["index_size"],
             package_count=row["package_count"],
             error=row["error"],
+            signing_fingerprints=fingerprints,
+            inrelease_sha256=row["inrelease_sha256"] if "inrelease_sha256" in row.keys() else None,
         )
 
     def list_publications(self, limit: int = 20) -> list[Publication]:
@@ -279,6 +333,143 @@ class Repository:
                 "ORDER BY id DESC LIMIT 1"
             ).fetchone()
         return self._row_to_publication(row) if row else None
+
+    # --------------------------------------------------------------- signing
+    def _effective_signing(self) -> dict[str, object] | None:
+        """The single effective signing row, or ``None`` while unsigned."""
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM signing_state WHERE id=1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "updated_at": row["updated_at"],
+            "publication_id": row["publication_id"],
+            "release_sha256": row["release_sha256"],
+            "fingerprints": json.loads(row["fingerprints_json"]),
+            "keyset_sha256": row["keyset_sha256"],
+            "inrelease_sha256": row["inrelease_sha256"],
+        }
+
+    def effective_signing(self) -> dict[str, object] | None:
+        state = self._effective_signing()
+        if state is None:
+            return None
+        return dict(state)
+
+    def available_signing_keys(self) -> list[str]:
+        try:
+            return self.signer.available_fingerprints()
+        except GpgError:
+            return []
+
+    def _record_signing_event(
+        self, requested: list[str], result: str, detail: str | None
+    ) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO signing_events (created_at, requested_json, "
+                "result, detail) VALUES (?, ?, ?, ?)",
+                (_utcnow(), json.dumps(requested), result, detail),
+            )
+
+    def rotate_signing(self, requested: list[str]) -> dict[str, object]:
+        """Re-sign the current Release with a new effective key set.
+
+        No package is re-uploaded and no publication is created: the existing
+        Release blob is signed again and the fixed ``InRelease`` path is
+        atomically swapped.  On any validation, signing or write failure the
+        previously effective Release/InRelease pair is left untouched.
+        """
+
+        with self._exclusive():
+            current = self.current_publication()
+            if current is None:
+                raise PublicationError(
+                    "publish at least one release before enabling signing"
+                )
+            try:
+                fingerprints = self.signer.validate(requested)
+            except GpgError as exc:
+                self._record_signing_event(requested, "rejected", str(exc))
+                raise PublicationError(str(exc)) from exc
+
+            release_path = (
+                self.export
+                / f"{self.settings.release_by_hash_prefix}/{current.release_sha256}"
+            )
+            try:
+                release_bytes = release_path.read_bytes()
+            except OSError as exc:
+                self._record_signing_event(
+                    fingerprints, "failed", f"Release unreadable: {exc}"
+                )
+                raise PublicationError(f"current Release is unreadable: {exc}") from exc
+
+            try:
+                inrelease = self.signer.sign_release(release_bytes, fingerprints)
+            except GpgError as exc:
+                self._record_signing_event(fingerprints, "failed", str(exc))
+                raise PublicationError(str(exc)) from exc
+            inrelease_sha = sha256_hex(inrelease)
+            ks_hash = keyset_hash(fingerprints)
+
+            try:
+                atomic_write(
+                    self.export
+                    / f"{self.settings.inrelease_prefix}/{inrelease_sha}",
+                    inrelease,
+                )
+                atomic_write(self.export / self.settings.inrelease_path, inrelease)
+            except OSError as exc:
+                self._record_signing_event(
+                    fingerprints, "failed", f"InRelease write failed: {exc}"
+                )
+                raise PublicationError(f"failed to write InRelease: {exc}") from exc
+
+            with self._connect() as db:
+                db.execute(
+                    "INSERT INTO signing_state (id, updated_at, publication_id, "
+                    "release_sha256, fingerprints_json, keyset_sha256, "
+                    "inrelease_sha256) VALUES (1, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, "
+                    "publication_id=excluded.publication_id, "
+                    "release_sha256=excluded.release_sha256, "
+                    "fingerprints_json=excluded.fingerprints_json, "
+                    "keyset_sha256=excluded.keyset_sha256, "
+                    "inrelease_sha256=excluded.inrelease_sha256",
+                    (
+                        _utcnow(),
+                        current.id,
+                        current.release_sha256,
+                        json.dumps(fingerprints),
+                        ks_hash,
+                        inrelease_sha,
+                    ),
+                )
+            self._record_signing_event(fingerprints, "effective", None)
+            self._garbage_collect()
+            effective = self._effective_signing()
+            assert effective is not None
+            return effective
+
+    def list_signing_events(self, limit: int = 20) -> list[dict[str, object]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM signing_events ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "created_at": row["created_at"],
+                "requested": json.loads(row["requested_json"]),
+                "result": row["result"],
+                "detail": row["detail"],
+            }
+            for row in rows
+        ]
 
     # ------------------------------------------------------------- publishing
     def publish(self, uploads: list[StagedUpload]) -> Publication:
@@ -390,9 +581,28 @@ class Repository:
         created_at = _utcnow()
         uploads_by_dest = prepared.uploads
 
+        # Sign with the currently effective key set *before* any journal or
+        # repository state changes.  A GPG failure therefore leaves both the
+        # previous release and its previous InRelease fully usable.
+        effective = self._effective_signing()
+        fingerprints: list[str] = list(effective["fingerprints"]) if effective else []
+        inrelease: bytes | None = None
+        inrelease_sha: str | None = None
+        if fingerprints:
+            try:
+                inrelease = self.signer.sign_release(release, fingerprints)
+            except GpgError as exc:
+                raise PublicationError(str(exc)) from exc
+            inrelease_sha = sha256_hex(inrelease)
+
         plan = self._file_plan(prepared)
         plan.append((f"{s.release_by_hash_prefix}/{release_sha}", "release_by_hash"))
         plan.append((s.release_path, "release"))
+        if inrelease is not None:
+            plan.append(
+                (f"{s.inrelease_prefix}/{inrelease_sha}", "inrelease_by_hash")
+            )
+            plan.append((s.inrelease_path, "inrelease"))
 
         packages_json = json.dumps([entry.to_dict() for _i, entry in pairs])
 
@@ -400,7 +610,8 @@ class Repository:
             cursor = db.execute(
                 "INSERT INTO publications (created_at, state, release_sha256, "
                 "index_sha256, plain_index_sha256, index_size, package_count, "
-                "packages_json) VALUES (?, 'staged', ?, ?, ?, ?, ?, ?)",
+                "packages_json, signing_fingerprints_json, inrelease_sha256) "
+                "VALUES (?, 'staged', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     created_at,
                     release_sha,
@@ -409,6 +620,8 @@ class Repository:
                     len(index_gz),
                     len(pairs),
                     packages_json,
+                    json.dumps(fingerprints) if fingerprints else None,
+                    inrelease_sha,
                 ),
             )
             publication_id = int(cursor.lastrowid)
@@ -432,7 +645,15 @@ class Repository:
             atomic_write(self.export / s.plain_index_path, index)
             atomic_write(self.export / s.index_path, index_gz)
 
-            # 3. Commit point: the Release pointer.
+            # 3. The InRelease signs exactly this Release blob, so both become
+            #    visible together as part of the same commit sequence.
+            if inrelease is not None and inrelease_sha is not None:
+                atomic_write(
+                    self.export / f"{s.inrelease_prefix}/{inrelease_sha}", inrelease
+                )
+                atomic_write(self.export / s.inrelease_path, inrelease)
+
+            # 4. Commit point: the Release pointer.
             atomic_write(self.export / s.release_path, release)
             _fsync_dir(self.release_abspath.parent)
         except BaseException as exc:
@@ -448,6 +669,14 @@ class Repository:
                 "UPDATE publications SET state='committed' WHERE id=?",
                 (publication_id,),
             )
+            if fingerprints and inrelease_sha is not None:
+                # The effective state now describes the freshly committed
+                # publication; its Release/InRelease pair is what clients get.
+                db.execute(
+                    "UPDATE signing_state SET publication_id=?, release_sha256=?, "
+                    "inrelease_sha256=?, updated_at=? WHERE id=1",
+                    (publication_id, release_sha, inrelease_sha, _utcnow()),
+                )
         self._garbage_collect()
 
         with self._connect() as db:
@@ -500,6 +729,7 @@ class Repository:
                             ("interrupted before commit", row["id"]),
                         )
             self._restore_fixed_paths()
+            self._restore_signing_state()
             self._garbage_collect()
             cleanup_incoming(self.incoming)
 
@@ -532,6 +762,53 @@ class Repository:
         if release_src.exists() and _file_sha(release_dst) != release_sha:
             atomic_write(release_dst, release_src.read_bytes())
 
+    def _restore_signing_state(self) -> None:
+        """Re-materialise the last effective InRelease after a restart.
+
+        The signing journal is the source of truth.  If the content-addressed
+        InRelease survived it is simply relinked; otherwise the recorded
+        Release is re-signed with the recorded fingerprints (the GnuPG home is
+        a durable part of the data volume).  When neither is possible the
+        existing fixed InRelease is left as-is rather than weakening state.
+        """
+
+        s = self.settings
+        state = self._effective_signing()
+        if state is None:
+            return
+        inrelease_sha = str(state["inrelease_sha256"])
+        stored = self.export / f"{s.inrelease_prefix}/{inrelease_sha}"
+        fixed = self.export / s.inrelease_path
+        if stored.exists():
+            if _file_sha(fixed) != inrelease_sha:
+                atomic_write(fixed, stored.read_bytes())
+            return
+        release_src = (
+            self.export
+            / f"{s.release_by_hash_prefix}/{state['release_sha256']}"
+        )
+        if not release_src.exists():
+            return
+        try:
+            regenerated = self.signer.sign_release(
+                release_src.read_bytes(), list(state["fingerprints"])
+            )
+        except GpgError:
+            return
+        if sha256_hex(regenerated) != inrelease_sha:
+            # Different gpg version/armor: accept the regenerated blob and
+            # record its actual hash so serving and verification stay aligned.
+            inrelease_sha = sha256_hex(regenerated)
+            with self._connect() as db:
+                db.execute(
+                    "UPDATE signing_state SET inrelease_sha256=? WHERE id=1",
+                    (inrelease_sha,),
+                )
+        atomic_write(
+            self.export / f"{s.inrelease_prefix}/{inrelease_sha}", regenerated
+        )
+        atomic_write(fixed, regenerated)
+
     # ------------------------------------------------------------- file reads
     def _fixed_path_target(self, relpath: str) -> tuple[Path, str] | None:
         """Map a fixed (mutable) path to the content-addressed file for the
@@ -544,7 +821,12 @@ class Repository:
         """
 
         s = self.settings
-        if relpath not in (s.release_path, s.index_path, s.plain_index_path):
+        if relpath not in (
+            s.release_path,
+            s.index_path,
+            s.plain_index_path,
+            s.inrelease_path,
+        ):
             return None
         with self._connect() as db:
             latest = self._latest_committed(db)
@@ -555,6 +837,14 @@ class Repository:
                     self.export / f"{s.release_by_hash_prefix}/{latest['release_sha256']}",
                     latest["release_sha256"],
                 )
+            if relpath == s.inrelease_path:
+                # The InRelease is owned by the effective signing state, which
+                # always points at the same Release content currently served.
+                state = self._effective_signing()
+                if state is None:
+                    return None
+                digest = str(state["inrelease_sha256"])
+                return self.export / f"{s.inrelease_prefix}/{digest}", digest
             if relpath == s.index_path:
                 digest = latest["index_sha256"]
             else:
@@ -641,6 +931,19 @@ class Repository:
                     continue
                 with contextlib.suppress(FileNotFoundError):
                     path.unlink()
+        # InRelease blobs are owned by the effective signing state (a rotation
+        # keeps the same Release but replaces its signature).  Anything no
+        # longer referenced is superseded and can be collected.
+        state = self._effective_signing()
+        keep_inrelease = (
+            {str(state["inrelease_sha256"])} if state is not None else set()
+        )
+        inrelease_root = self.export / s.inrelease_prefix
+        if inrelease_root.exists():
+            for path in inrelease_root.iterdir():
+                if path.is_file() and path.name not in keep_inrelease:
+                    with contextlib.suppress(FileNotFoundError):
+                        path.unlink()
         # Remove temporary files left behind by an interrupted atomic write.
         for tmp in self.export.rglob(".*.tmp"):
             if tmp.is_file():
@@ -651,6 +954,7 @@ class Repository:
     def status(self) -> dict[str, object]:
         s = self.settings
         current = self.current_publication()
+        effective = self._effective_signing()
         return {
             "distribution": s.distribution,
             "component": s.component,
@@ -658,7 +962,22 @@ class Repository:
             "retention": s.retention,
             "sources_list": s.sources_line,
             "release_url": f"/{s.release_path}",
+            "inrelease_url": f"/{s.inrelease_path}",
             "current": current.to_dict() if current else None,
+            "signing": {
+                "enabled": effective is not None,
+                "effective_fingerprints": (
+                    list(effective["fingerprints"]) if effective else []
+                ),
+                "inrelease_sha256": (
+                    effective["inrelease_sha256"] if effective else None
+                ),
+                "publication_id": (
+                    effective["publication_id"] if effective else None
+                ),
+                "updated_at": effective["updated_at"] if effective else None,
+                "available_fingerprints": self.available_signing_keys(),
+            },
             "publications": [p.to_dict() for p in self.list_publications(20)],
         }
 

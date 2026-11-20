@@ -24,6 +24,7 @@ from email.utils import formatdate
 from pathlib import Path
 
 import anyio
+from pydantic import BaseModel, Field
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.openapi.docs import get_swagger_ui_html
@@ -38,6 +39,7 @@ from fastapi.responses import (
 from starlette.background import BackgroundTask
 
 from .config import Settings
+from .signing import MAX_SIGNING_KEYS
 from .storage import PublicationError, Repository, StagedUpload
 
 #: Content types Debian clients expect for the repository documents.
@@ -48,6 +50,34 @@ _MEDIA_TYPES = {
     "InRelease": "text/plain; charset=utf-8",
     "Release.gpg": "application/pgp-signature",
 }
+
+
+class SigningRequest(BaseModel):
+    """One or two fingerprints of keys pre-provisioned on the server.
+
+    The same request body drives the whole rotation lifecycle: a single
+    fingerprint enables or pins one key, two fingerprints enable dual
+    signing during the transition, and switching back to one fingerprint
+    retires the other key.
+    """
+
+    fingerprints: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_SIGNING_KEYS,
+        description=(
+            "GPG key fingerprints (40 hex characters) of 1-2 secret keys "
+            "pre-provisioned on the server. The current Release is re-signed "
+            "with exactly this key set; no package is re-uploaded."
+        ),
+        examples=[
+            ["312946026F61D34456D207E26CE5A0CCE6B93F02"],
+            [
+                "312946026F61D34456D207E26CE5A0CCE6B93F02",
+                "AE3355CB89E8A83F9DEA1161C2BAED552D23F6C3",
+            ],
+        ],
+    )
 
 UPLOAD_FORM = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -71,6 +101,13 @@ indexes are on disk; the two most recent publications stay downloadable.</p>
   <input type="file" name="files" multiple accept=".deb" required></label><br>
   <button type="submit">Publish</button>
 </form>
+<h2>Release signing / key rotation</h2>
+<p class="hint">Provision 1-2 secret keys in the server's GnuPG home, then POST
+ the pre-provisioned fingerprints to <code>/api/signing</code> (also available
+ in <a href="/swagger-ui">Swagger UI</a>). The current Release is re-signed as a
+ standard <code>InRelease</code> without re-uploading any package or creating a
+ new publication. Use <code>GET /api/signing/keys</code> to list available
+ fingerprints.</p>
 <h2>Client configuration</h2>
 <pre>echo 'deb [trusted=yes arch={architecture}] {base_url} {suite} {component}' \\
   | sudo tee /etc/apt/sources.list.d/internal.list
@@ -137,6 +174,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             f"  {settings.sources_line}\n\n"
             "Then run: apt-get update && apt-get download <package>\n\n"
             "Upload packages at /docs or POST them to /api/publish.\n"
+            "Sign/rotate Release keys via POST /api/signing "
+            "(see /swagger-ui and /api/signing/keys).\n"
         )
 
     @app.get("/docs", response_class=HTMLResponse, include_in_schema=False)
@@ -234,6 +273,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             {"publications": [p.to_dict() for p in repository.list_publications(50)]}
         )
+
+    @app.get("/api/signing/keys")
+    def signing_keys() -> JSONResponse:
+        """Fingerprints of the secret keys provisioned on this server."""
+
+        return JSONResponse(
+            {
+                "available_fingerprints": repository.available_signing_keys(),
+                "max_keys": MAX_SIGNING_KEYS,
+            }
+        )
+
+    @app.get(
+        "/api/signing/keys/{fingerprint}/public",
+        response_class=PlainTextResponse,
+    )
+    def signing_public_key(fingerprint: str) -> PlainTextResponse:
+        """Armored public key for a provisioned fingerprint (for signed-by)."""
+
+        try:
+            armored = repository.signer.export_public_key(fingerprint)
+        except Exception as exc:  # noqa: BLE001 - normalized into a 400
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return PlainTextResponse(
+            armored,
+            headers={"Content-Disposition": f'inline; filename="{fingerprint}.asc"'},
+        )
+
+    @app.post("/api/signing", response_model=None)
+    def rotate_signing(payload: SigningRequest) -> JSONResponse:
+        """Re-sign the current Release with the requested key set.
+
+        The existing publication is reused: the response carries the original
+        publication id/number and the fingerprints that became effective.
+        """
+
+        try:
+            effective = repository.rotate_signing(payload.fingerprints)
+        except PublicationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        current = repository.current_publication()
+        return JSONResponse(
+            status_code=200,
+            content={
+                "publication": current.to_dict() if current else None,
+                "publication_id": effective["publication_id"],
+                "release_sha256": effective["release_sha256"],
+                "effective_fingerprints": effective["fingerprints"],
+                "inrelease_sha256": effective["inrelease_sha256"],
+                "inrelease_url": f"/{settings.inrelease_path}",
+            },
+        )
+
+    @app.get("/api/signing/events")
+    def signing_events() -> JSONResponse:
+        return JSONResponse({"events": repository.list_signing_events(50)})
 
     def _lease_headers(lease) -> dict[str, str]:  # type: ignore[no-untyped-def]
         return {

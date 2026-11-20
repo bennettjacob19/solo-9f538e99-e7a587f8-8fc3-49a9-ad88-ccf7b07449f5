@@ -1,9 +1,17 @@
 # Internal APT source
 #
-# Install as /etc/apt/sources.list.d/internal.list (or append to sources.list).
-# Adjust the host/port to your deployment.
+# Install as /etc/apt/sources.list.d/internal.list (or append to sources.list)
+# and adjust the host/port to your deployment.
 #
-# The repository is unsigned; `trusted=yes` is required. Once you sign the
-# Release file, replace it with:
-#   signed-by=/usr/share/keyrings/internal.gpg
+# The repository signs its Release file (InRelease). Export the matching
+# public key(s) and reference them with signed-by, e.g.:
+#   gpg --export <FINGERPRINT> | sudo tee /usr/share/keyrings/internal.gpg >/dev/null
+#
+# During an old->new key rotation, trust both keys at once:
+#   cat old.gpg new.gpg | sudo tee /usr/share/keyrings/internal.gpg >/dev/null
+#
+# Signed configuration (recommended):
+# deb [arch=amd64 signed-by=/usr/share/keyrings/internal.gpg] http://127.0.0.1:8080/ stable main
+#
+# Unsigned fallback (only while signing is disabled):
 deb [trusted=yes arch=amd64] http://127.0.0.1:8080/ stable main
