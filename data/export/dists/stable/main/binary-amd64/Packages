@@ -1,0 +1,11 @@
+Package: smoke-one
+Version: 3.0.0
+Architecture: amd64
+Maintainer: Test <test@example.com>
+Section: misc
+Priority: optional
+Filename: pool/main/s/smoke-one/smoke-one_3.0.0_amd64_01754aaca31f14de.deb
+Size: 788
+SHA256: 01754aaca31f14ded926669676cdd65b8c8e40412e5e66fd827f91740d86f11f
+Description: smoke-one test package
+

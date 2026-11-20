@@ -1,0 +1,12 @@
+Origin: Internal APT Repository
+Label: Internal APT Repository
+Suite: stable
+Codename: stable
+Date: Fri, 20 Nov 2026 06:56:17 UTC
+Architectures: amd64
+Components: main
+Description: Internal single-component APT repository
+Acquire-By-Hash: yes
+SHA256:
+ c8ca5eb46c273b1d418cba34350670c7f387235ad711e78533dbcdee13f22fca 636 main/binary-amd64/Packages
+ b7e05ebe72479ec9c9371caaca80c470c4561cd9e89380569e250360e34e7ba0 322 main/binary-amd64/Packages.gz

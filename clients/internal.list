@@ -1,0 +1,9 @@
+# Internal APT source
+#
+# Install as /etc/apt/sources.list.d/internal.list (or append to sources.list).
+# Adjust the host/port to your deployment.
+#
+# The repository is unsigned; `trusted=yes` is required. Once you sign the
+# Release file, replace it with:
+#   signed-by=/usr/share/keyrings/internal.gpg
+deb [trusted=yes arch=amd64] http://127.0.0.1:8080/ stable main

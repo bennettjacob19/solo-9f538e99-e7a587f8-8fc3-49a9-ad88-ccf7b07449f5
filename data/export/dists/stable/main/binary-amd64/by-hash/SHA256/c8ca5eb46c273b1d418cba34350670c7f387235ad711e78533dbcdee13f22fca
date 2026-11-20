@@ -1,0 +1,22 @@
+Package: smoke-one
+Version: 1.0.0
+Architecture: amd64
+Maintainer: Test <test@example.com>
+Section: misc
+Priority: optional
+Filename: pool/main/s/smoke-one/smoke-one_1.0.0_amd64_58b114f5afdacc20.deb
+Size: 792
+SHA256: 58b114f5afdacc20c47fad080564cf8da17fef9ad7a395c78dce9d259ac44cb4
+Description: smoke-one test package
+
+Package: smoke-two
+Version: 2.0.0
+Architecture: amd64
+Maintainer: Test <test@example.com>
+Section: misc
+Priority: optional
+Filename: pool/main/s/smoke-two/smoke-two_2.0.0_amd64_67db06e0a8f1a6ab.deb
+Size: 788
+SHA256: 67db06e0a8f1a6abdd1e8cd3c2e9e5d8cac5e2ae2d648c4a708c99ac8f5b9ba6
+Description: smoke-two test package
+
